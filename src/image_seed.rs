@@ -37,8 +37,8 @@
 
 #[cfg(unix)]
 pub use imp::{
-    discard_unbooted_archive_storage, prewarm_recent_seeds, revalidate_seed, seed_root,
-    seed_storage, seed_storage_with_trust, seedable_image, wants_seed, SEED_MACHINE_PREFIX,
+    discard_unbooted_storage, prewarm_recent_seeds, revalidate_seed, seed_root, seed_storage,
+    seed_storage_with_trust, seedable_image, wants_seed, SEED_MACHINE_PREFIX,
 };
 
 /// The smolvm binary that builds seeds. The SDKs run inside `node` or `python`,
@@ -188,7 +188,7 @@ pub fn seed_storage_with_trust(
 
 /// Seeds need a Unix host; elsewhere there is no seed to make room for.
 #[cfg(not(unix))]
-pub fn discard_unbooted_archive_storage(_: &str, _: &str) -> bool {
+pub fn discard_unbooted_storage(_: &str, _: &str, _: bool) -> bool {
     false
 }
 
@@ -286,12 +286,23 @@ mod imp {
     }
 
     /// Remove the blank storage disk a fresh machine `name` got at create, so its
-    /// first start can take a seed of the staged archive `image` it now boots.
-    /// Only for a staged archive: the server creates a machine's disks before
-    /// its start fetches the image on the host, so the disk exists but holds
-    /// nothing. Callers pass only machines that have never completed a start.
-    pub fn discard_unbooted_archive_storage(name: &str, image: &str) -> bool {
-        if local_archive(image).is_none_or(|archive| !archive.is_file()) {
+    /// first start can take a seed of `image`. The server creates a machine's
+    /// disks before its first start, so the disk exists but holds nothing; two
+    /// kinds of image only become seedable at that start:
+    ///
+    /// - a staged archive, which the start fetches on the host;
+    /// - a private registry image, when the start brings the registry
+    ///   credentials (`start_has_credentials`) that the create did not have, so
+    ///   the create's seed attempt was refused.
+    ///
+    /// Callers pass only machines that have never completed a start.
+    pub fn discard_unbooted_storage(name: &str, image: &str, start_has_credentials: bool) -> bool {
+        let archive = local_archive(image).is_some_and(|archive| archive.is_file());
+        let registry = start_has_credentials
+            && local_archive(image).is_none()
+            && !crate::data::image_source::is_local_ref(image)
+            && crate::data::image_source::packed_layers_dir_for_ref(image).is_none();
+        if !archive && !registry {
             return false;
         }
         let base = crate::agent::vm_data_dir(name).join(crate::storage::STORAGE_DISK_FILENAME);
@@ -848,7 +859,24 @@ mod imp {
             if let Some(no_proxy) = no_proxy {
                 start.extend(["--no-proxy", no_proxy]);
             }
-            run(exe, &start)?;
+            // The builder pulls with the caller's credentials, as the caller's own
+            // machine would, not with the host's registry config: a private image
+            // the start brought credentials for is otherwise refused here.
+            let credentials = match auth {
+                PullAuth::Basic { username, password } => {
+                    start.push("--registry-auth-stdin");
+                    let auth = crate::registry::RegistryAuth {
+                        username: username.clone(),
+                        password: password.clone(),
+                    };
+                    let mut line = serde_json::to_vec(&auth)
+                        .map_err(|e| Error::config("image seed", e.to_string()))?;
+                    line.push(b'\n');
+                    Some(line)
+                }
+                _ => None,
+            };
+            run_with_input(exe, &start, credentials.as_deref())?;
             // Compare the guest's stored config and layer digests to the
             // caller-authorized platform manifest. A second HEAD alone misses
             // tag ABA and a registry mirror serving different image bytes.
@@ -1251,15 +1279,33 @@ mod imp {
     /// Run one step of a seed build with this smolvm binary, capturing its output so
     /// the builder's chatter stays off the caller's terminal.
     fn run(exe: &Path, args: &[&str]) -> Result<()> {
-        let out = std::process::Command::new(exe)
+        run_with_input(exe, args, None)
+    }
+
+    /// [`run`], writing `input` to the step's stdin (and closing it) first.
+    fn run_with_input(exe: &Path, args: &[&str], input: Option<&[u8]>) -> Result<()> {
+        use std::io::Write;
+        let seed_error = |e: std::io::Error| Error::config("image seed", e.to_string());
+        let mut child = std::process::Command::new(exe)
             .args(args)
             .env("SMOLVM_IMAGE_SEEDS", "0")
             // An embedder's helper variable would tie the builder VM's life to
             // this short-lived CLI process, killing it as soon as `start` returns.
             .env_remove("SMOLVM_BOOT_BINARY")
-            .stdin(std::process::Stdio::null())
-            .output()
-            .map_err(|e| Error::config("image seed", e.to_string()))?;
+            .stdin(if input.is_some() {
+                std::process::Stdio::piped()
+            } else {
+                std::process::Stdio::null()
+            })
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(seed_error)?;
+        if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+            // A step that exits before reading reports its own error below.
+            let _ = stdin.write_all(input);
+        }
+        let out = child.wait_with_output().map_err(seed_error)?;
         if out.status.success() {
             return Ok(());
         }
@@ -1388,6 +1434,36 @@ mod tests {
         assert_eq!(seedable.as_deref(), Some(reference.as_str()));
         // A rootfs directory still boots as it is.
         assert!(seedable_image(name, Some("local-dir:/srv/rootfs"), None).is_none());
+    }
+
+    #[test]
+    fn a_first_start_with_credentials_replaces_the_blank_disk_of_a_private_image() {
+        let name = format!("seed-private-discard-test-{}", std::process::id());
+        let image = "registry.example.com/team/private@sha256:".to_string() + &"a".repeat(64);
+        let dir = crate::agent::vm_data_dir(&name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let disk = dir.join(crate::storage::STORAGE_DISK_FILENAME);
+        std::fs::write(&disk, b"").unwrap();
+        // The create left a blank disk, which blocks a seed.
+        assert!(seedable_image(&name, Some(&image), None).is_none());
+
+        // A start without credentials keeps the disk: nothing new can seed.
+        assert!(!discard_unbooted_storage(&name, &image, false));
+        assert!(disk.exists());
+        // A local rootfs never seeds, credentials or not.
+        assert!(!discard_unbooted_storage(
+            &name,
+            "local-dir:/srv/rootfs",
+            true
+        ));
+        assert!(disk.exists());
+
+        // A start that brings the registry credentials drops it and can seed.
+        assert!(discard_unbooted_storage(&name, &image, true));
+        assert!(!disk.exists());
+        let seedable = seedable_image(&name, Some(&image), None);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(seedable.as_deref(), Some(image.as_str()));
     }
 
     #[test]
