@@ -688,4 +688,25 @@ test_stdout_no_status_messages() {
 
 run_test "Output: stdout has only command output, no status" test_stdout_no_status_messages || true
 
+# =============================================================================
+# A run whose VM never starts leaves no data directory (#1995)
+# =============================================================================
+
+test_machine_run_failed_start_leaves_no_data_dir() {
+    local out name cache
+    if out=$(SMOLVM_AGENT_ROOTFS=/nonexistent-agent-rootfs "$SMOLVM" machine run --image alpine -- echo hi 2>&1); then
+        echo "FAIL: a run with a missing agent rootfs succeeded"
+        return 1
+    fi
+    name=$(sed -n 's/^Starting ephemeral machine (\(vm-[0-9a-f]*\)).*/\1/p' <<<"$out")
+    [[ -n "$name" ]] || { echo "FAIL: no machine name in: $out"; return 1; }
+    if [[ "$(uname)" == Darwin ]]; then cache="$HOME/Library/Caches"; else cache="${XDG_CACHE_HOME:-$HOME/.cache}"; fi
+    if grep -lx "$name" "$cache"/smolvm/vms/*/name 2>/dev/null | grep -q .; then
+        echo "FAIL: $name left its data directory"
+        return 1
+    fi
+}
+
+run_test "Machine run: a failed start leaves no data directory" test_machine_run_failed_start_leaves_no_data_dir || true
+
 print_summary "Machine Run Tests"
