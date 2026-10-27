@@ -4026,6 +4026,108 @@ pub fn resize_vm(
 // Ephemeral VM Tracking
 // ============================================================================
 
+/// Removes an ephemeral `machine run`'s data directory if the run returns
+/// before its VM starts.
+///
+/// Until the VM starts nothing registers the run, and the orphan sweep finds
+/// runs only through their DB records, so a run that fails before then (a
+/// missing agent rootfs, `--ssh-agent` without `SSH_AUTH_SOCK`) would leave its
+/// disks where nothing ever deletes them. Armed only when this run creates the
+/// directory, so it never removes one another machine already owns. Disarmed
+/// once the VM starts; from there registration and the run's teardown own the
+/// directory.
+pub(crate) struct UnstartedRunDataDir {
+    name: String,
+    armed: bool,
+}
+
+impl UnstartedRunDataDir {
+    pub(crate) fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            armed: !vm_data_dir(name).exists(),
+        }
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for UnstartedRunDataDir {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        match std::fs::remove_dir_all(vm_data_dir(&self.name)) {
+            Ok(()) => {
+                tracing::debug!(machine = %self.name, "removed the data of a run that did not start");
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(machine = %self.name, %error, "could not remove the data of a run that did not start");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod unstarted_run_data_dir_tests {
+    use super::*;
+
+    fn unique_name(tag: &str) -> String {
+        format!("unstarted-{tag}-{}", SmolvmDb::create_reservation_token())
+    }
+
+    /// A run dropped before its VM starts leaves nothing on disk.
+    #[test]
+    fn a_run_that_never_started_removes_the_data_it_wrote() {
+        let name = unique_name("failed");
+        let data = vm_data_dir(&name);
+        {
+            let _guard = UnstartedRunDataDir::new(&name);
+            std::fs::create_dir_all(&data).unwrap();
+            std::fs::write(data.join("storage.raw"), b"partial").unwrap();
+        }
+        assert!(!data.exists(), "{} was left behind", data.display());
+    }
+
+    /// Once the VM starts, the run's directory is not the guard's to remove.
+    #[test]
+    fn a_started_run_keeps_its_data() {
+        let name = unique_name("started");
+        let data = vm_data_dir(&name);
+        {
+            let mut guard = UnstartedRunDataDir::new(&name);
+            std::fs::create_dir_all(&data).unwrap();
+            guard.disarm();
+        }
+        let kept = data.exists();
+        let _ = std::fs::remove_dir_all(&data);
+        assert!(kept, "a started run's data was removed");
+    }
+
+    /// A directory that existed before the run belongs to someone else.
+    #[test]
+    fn a_directory_that_existed_before_the_run_is_left_alone() {
+        let name = unique_name("existing");
+        let data = vm_data_dir(&name);
+        std::fs::create_dir_all(&data).unwrap();
+        drop(UnstartedRunDataDir::new(&name));
+        let kept = data.exists();
+        let _ = std::fs::remove_dir_all(&data);
+        assert!(kept, "an existing machine's data was removed");
+    }
+
+    /// A run that failed before writing anything is not an error.
+    #[test]
+    fn a_run_that_wrote_nothing_is_fine() {
+        let name = unique_name("nothing");
+        drop(UnstartedRunDataDir::new(&name));
+        assert!(!vm_data_dir(&name).exists());
+    }
+}
+
 /// Register an ephemeral VM in the database for tracking.
 ///
 /// Called by `machine run` after the VM is forked. The record is removed

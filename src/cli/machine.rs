@@ -1979,6 +1979,13 @@ impl RunCmd {
         } else {
             params.image.clone()
         };
+        // Nothing registers this run until its VM starts, so remove the data
+        // directory the steps below create if the run returns before then.
+        // Ephemeral runs only: their generated name is theirs alone, while a
+        // detached run's name (`default` or `--name`) can be shared with a
+        // concurrent run whose directory this must not remove.
+        let mut unstarted_data_dir =
+            (!self.detach).then(|| vm_common::UnstartedRunDataDir::new(&vm_name));
         smolvm::image_seed::seed_ephemeral_run_with_trust(
             &vm_name,
             seed_image.as_deref(),
@@ -2074,6 +2081,9 @@ impl RunCmd {
         let freshly_started = manager
             .ensure_running_with_full_config(mounts.clone(), ports, resources, features)
             .map_err(|e| Error::agent("start machine", e.to_string()))?;
+        if let Some(guard) = unstarted_data_dir.as_mut() {
+            guard.disarm();
+        }
 
         // Tell the user how to reach the guest's Docker daemon from the host.
         // libkrun exposes the bridge as a Unix socket in the VM data dir; a
