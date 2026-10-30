@@ -394,7 +394,6 @@ pub fn set_dumpable(_dumpable: bool) {}
 // ============================================================================
 
 /// CPU accounting period for `cpu.max` (cgroup v2 default, 100 ms).
-#[cfg(target_os = "linux")]
 const CGROUP_CPU_PERIOD_US: u64 = 100_000;
 
 /// Cap on host tasks (threads/processes) a single VMM may spawn. Guest processes
@@ -505,7 +504,8 @@ pub fn setup_cgroup_delegation_root() -> Option<std::path::PathBuf> {
 /// `root`, deriving limits from the VM's resources.
 ///
 /// Caps applied (best-effort, each independently):
-/// - `cpu.max` = `vcpus * 100ms / 100ms` → bounds CPU to ~`vcpus` cores.
+/// - `cpu.max` grants `cpu_quota_usec_per_sec` of CPU per second: one CPU per
+///   vCPU, or less under the machine's CPU limit.
 /// - `pids.max` = [`CGROUP_PIDS_MAX`] → caps host tasks (fork-bomb containment).
 /// - `memory.high`/`memory.max` = guest RAM, unreclaimable-mapping allowance,
 ///   and proportional overhead, with a reclaim stage below the ceiling.
@@ -513,32 +513,27 @@ pub fn setup_cgroup_delegation_root() -> Option<std::path::PathBuf> {
 /// `root` must be a delegated root with `cpu`/`memory`/`pids` enabled in its
 /// `subtree_control` (see [`setup_cgroup_delegation_root`]); otherwise the limit
 /// files won't exist and the caps silently degrade while the process still runs.
-/// Never blocks boot.
+/// Never blocks boot. Returns whether the VMM joined the leaf.
 #[cfg(target_os = "linux")]
 pub fn place_in_cgroup(
     root: &std::path::Path,
-    vcpus: u8,
+    cpu_quota_usec_per_sec: u64,
     memory_mib: u32,
     cuda: bool,
     memfd_backed: bool,
-) {
+) -> bool {
     let pid = unsafe { libc::getpid() };
     let vm = root.join(format!("vm-{pid}"));
     if let Err(e) = std::fs::create_dir(&vm) {
         if e.kind() != std::io::ErrorKind::AlreadyExists {
             tracing::debug!(error = %e, dir = %vm.display(),
                 "could not create per-VM cgroup; VMM running uncapped");
-            return;
+            return false;
         }
     }
 
     // Set limits on the leaf *before* joining it.
-    let quota_us = u64::from(vcpus.max(1)) * CGROUP_CPU_PERIOD_US;
-    let _ = write_cgroup(
-        &vm,
-        "cpu.max",
-        &format!("{quota_us} {CGROUP_CPU_PERIOD_US}"),
-    );
+    let _ = write_cgroup(&vm, "cpu.max", &cpu_max_line(cpu_quota_usec_per_sec));
     let _ = write_cgroup(&vm, "pids.max", &CGROUP_PIDS_MAX.to_string());
     let budget = vmm_memory_budget(memory_mib, cuda, memfd_backed);
     let memory_limit_bytes = budget.max_bytes;
@@ -550,12 +545,13 @@ pub fn place_in_cgroup(
     if let Err(e) = write_cgroup(&vm, "cgroup.procs", &pid.to_string()) {
         tracing::debug!(error = %e, "failed to join per-VM cgroup; VMM running uncapped");
         let _ = std::fs::remove_dir(&vm); // leave no empty cgroup behind
-        return;
+        return false;
     }
     tracing::info!(
-        vcpus, memory_mib, cuda, memory_limit_bytes, cgroup = %vm.display(),
+        cpu_quota_usec_per_sec, memory_mib, cuda, memory_limit_bytes, cgroup = %vm.display(),
         "placed VMM subprocess in per-VM cgroup with cpu/pids/memory caps"
     );
+    true
 }
 
 /// Host-memory budget for one VMM's cgroup: a reclaim threshold and a hard
@@ -850,17 +846,66 @@ pub fn raise_managed_vmm_memory_budget(
 }
 
 /// Update only a verified VMM's own CPU quota, never a shared enclosing cgroup.
-#[cfg(target_os = "linux")]
 pub fn set_managed_vmm_cpu_count(
     machine: &str,
     pid: Pid,
     started: Option<u64>,
     cpus: u8,
 ) -> Result<bool> {
-    if cpus == 0 || !is_our_process_strict(pid, started) {
+    if cpus == 0 {
         return Err(Error::agent(
             "CPU resize",
             "invalid CPU count or VMM process identity changed",
+        ));
+    }
+    set_managed_vmm_cpu_quota(machine, pid, started, u64::from(cpus) * 1_000_000)
+}
+
+/// The `cpu.max` quota, per `period_us`, that grants `usec_per_sec` of CPU
+/// time per second. The kernel refuses a quota under 1 ms, so it never goes
+/// below that; [`cpu_max_period_us`] picks a period long enough that the floor
+/// does not raise the grant.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn cpu_max_quota_us(usec_per_sec: u64, period_us: u64) -> u64 {
+    (usec_per_sec.saturating_mul(period_us) / 1_000_000).max(1_000)
+}
+
+/// The `cpu.max` period for a grant of `usec_per_sec`: the 100 ms default, or
+/// longer (up to the kernel's 1 s maximum) when 1 ms per 100 ms would grant
+/// more than asked, as systemd stretches it for `CPUQuotaPerSecUSec`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn cpu_max_period_us(usec_per_sec: u64) -> u64 {
+    const DEFAULT: u64 = CGROUP_CPU_PERIOD_US;
+    const MAX: u64 = 1_000_000;
+    if usec_per_sec == 0 || usec_per_sec.saturating_mul(DEFAULT) / 1_000_000 >= 1_000 {
+        return DEFAULT;
+    }
+    (1_000u64 * 1_000_000).div_ceil(usec_per_sec).min(MAX)
+}
+
+/// The `cpu.max` contents granting `usec_per_sec` of CPU per second.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn cpu_max_line(usec_per_sec: u64) -> String {
+    let period = cpu_max_period_us(usec_per_sec);
+    format!("{} {period}", cpu_max_quota_us(usec_per_sec, period))
+}
+
+/// Set a verified VMM's own CPU quota to `usec_per_sec` of CPU time per
+/// second across all its threads (1_000_000 = one CPU), never a shared
+/// enclosing cgroup. The guest is not told: its vCPUs stay online and simply
+/// get less host time. Returns `false` when the VMM is not in a cgroup SmolVM
+/// owns, so no quota could be set.
+#[cfg(target_os = "linux")]
+pub fn set_managed_vmm_cpu_quota(
+    machine: &str,
+    pid: Pid,
+    started: Option<u64>,
+    usec_per_sec: u64,
+) -> Result<bool> {
+    if usec_per_sec == 0 || !is_our_process_strict(pid, started) {
+        return Err(Error::agent(
+            "CPU resize",
+            "invalid CPU quota or VMM process identity changed",
         ));
     }
     let Some(dir) = cgroup_v2_process_dir(pid) else {
@@ -868,34 +913,17 @@ pub fn set_managed_vmm_cpu_count(
     };
     let leaf = dir.file_name().and_then(|name| name.to_str()).unwrap_or("");
     if leaf == crate::systemd_scope::scope_name(machine) {
-        crate::systemd_scope::set_scope_cpu_count(machine, cpus)?;
+        crate::systemd_scope::set_scope_cpu_quota(machine, usec_per_sec)?;
     } else if leaf == format!("vm-{pid}") {
-        write_cgroup(
-            &dir,
-            "cpu.max",
-            &format!(
-                "{} {}",
-                u64::from(cpus) * CGROUP_CPU_PERIOD_US,
-                CGROUP_CPU_PERIOD_US
-            ),
-        )
-        .map_err(|error| Error::agent("CPU resize", format!("cannot update CPU quota: {error}")))?;
+        write_cgroup(&dir, "cpu.max", &cpu_max_line(usec_per_sec)).map_err(|error| {
+            Error::agent("CPU resize", format!("cannot update CPU quota: {error}"))
+        })?;
     } else {
         return Ok(false);
     }
     let quota = std::fs::read_to_string(dir.join("cpu.max"))
         .map_err(|error| Error::agent("CPU resize", format!("cannot verify CPU quota: {error}")))?;
-    let values: Vec<_> = quota.split_whitespace().collect();
-    let verified = match values.as_slice() {
-        [quota, period] => match (quota.parse::<u64>(), period.parse::<u64>()) {
-            (Ok(quota), Ok(period)) if period > 0 => {
-                period.checked_mul(u64::from(cpus)) == Some(quota)
-            }
-            _ => false,
-        },
-        _ => false,
-    };
-    if !verified || !is_our_process_strict(pid, started) {
+    if !cpu_max_matches(&quota, usec_per_sec) || !is_our_process_strict(pid, started) {
         return Err(Error::agent(
             "CPU resize",
             "CPU quota or VMM identity could not be verified after update",
@@ -904,13 +932,29 @@ pub fn set_managed_vmm_cpu_count(
     Ok(true)
 }
 
+/// Whether a `cpu.max` line grants exactly `usec_per_sec` per second, at
+/// whatever period it uses.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn cpu_max_matches(cpu_max: &str, usec_per_sec: u64) -> bool {
+    let values: Vec<_> = cpu_max.split_whitespace().collect();
+    match values.as_slice() {
+        [quota, period] => match (quota.parse::<u64>(), period.parse::<u64>()) {
+            (Ok(quota), Ok(period)) if period > 0 => {
+                cpu_max_quota_us(usec_per_sec, period) == quota
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 #[cfg(not(target_os = "linux"))]
 /// Report that this host has no Linux managed-scope CPU quota to update.
-pub fn set_managed_vmm_cpu_count(
+pub fn set_managed_vmm_cpu_quota(
     _machine: &str,
     _pid: Pid,
     _started: Option<u64>,
-    _cpus: u8,
+    _usec_per_sec: u64,
 ) -> Result<bool> {
     Ok(false)
 }
@@ -4352,6 +4396,44 @@ const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 0x0000_0004;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cpu_max_quota_scales_to_the_period_with_the_kernel_floor() {
+        // 200 millicpus = 0.2 CPU = 20 ms per 100 ms period.
+        assert_eq!(super::cpu_max_quota_us(200_000, 100_000), 20_000);
+        assert_eq!(super::cpu_max_quota_us(4_000_000, 100_000), 400_000);
+        // Under 1 ms per period the kernel refuses; systemd raises it to 1 ms.
+        assert_eq!(super::cpu_max_quota_us(1_000, 100_000), 1_000);
+        assert_eq!(super::cpu_max_quota_us(200_000, 50_000), 10_000);
+    }
+
+    #[test]
+    fn a_grant_under_one_percent_stretches_the_period_instead_of_rounding_up() {
+        assert_eq!(super::cpu_max_line(4_000_000), "400000 100000");
+        assert_eq!(super::cpu_max_line(200_000), "20000 100000");
+        assert_eq!(super::cpu_max_line(10_000), "1000 100000");
+        // 5 millicpus: 1 ms per 200 ms, not 1 ms per 100 ms.
+        assert_eq!(super::cpu_max_line(5_000), "1000 200000");
+        // 1 millicpu reaches the kernel's 1 s maximum period exactly.
+        assert_eq!(super::cpu_max_line(1_000), "1000 1000000");
+        for usec in [1_000, 3_000, 5_000, 9_999, 10_000, 200_000] {
+            assert!(
+                super::cpu_max_matches(&super::cpu_max_line(usec), usec),
+                "{usec}"
+            );
+        }
+    }
+
+    #[test]
+    fn cpu_max_read_back_must_grant_the_requested_quota() {
+        assert!(super::cpu_max_matches("20000 100000\n", 200_000));
+        assert!(super::cpu_max_matches("400000 100000", 4_000_000));
+        assert!(super::cpu_max_matches("10000 50000", 200_000));
+        assert!(!super::cpu_max_matches("400000 100000", 200_000));
+        assert!(!super::cpu_max_matches("max 100000", 200_000));
+        assert!(!super::cpu_max_matches("20000 0", 200_000));
+        assert!(!super::cpu_max_matches("", 200_000));
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn kqueue_errors_are_not_process_exit_events() {
@@ -4488,7 +4570,7 @@ mod tests {
             std::fs::write(vm.join(file), []).expect("create fake cgroup control");
         }
 
-        place_in_cgroup(root.path(), 2, 1024, true, false);
+        assert!(place_in_cgroup(root.path(), 2_000_000, 1024, true, false));
 
         assert_eq!(
             std::fs::read_to_string(vm.join("cpu.max")).expect("read boot CPU quota"),

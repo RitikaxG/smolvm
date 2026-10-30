@@ -1028,6 +1028,17 @@ pub struct MachineInfo {
     /// guest cannot reach, for virtio-net machines.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub egress_signals: Option<Vec<crate::agent::EgressSignal>>,
+    /// CPU limit in force on the running VMM, in milli-CPUs across all vCPUs,
+    /// set with `PUT /machines/{name}/cpu-limit` and reapplied on every later
+    /// launch until cleared. Omitted when none is set or the machine is stopped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 200)]
+    pub cpu_limit_millicpus: Option<u32>,
+    /// Open TCP flows of a running virtio-net machine, from the host-side
+    /// network stack's flow table, refreshed about every 15 s. Omitted for TSI
+    /// machines, stopped machines, and a summary older than two minutes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub egress_flows: Option<crate::agent::EgressFlowSummary>,
     /// Host-minted identity of this launch, as carried by mediated egress
     /// decisions (`machineId`), so a decider can map flows to the machine up
     /// front. Present only while a mediated-egress machine is running.
@@ -1210,6 +1221,30 @@ pub struct SetPortsRequest {
     /// them all. A running machine takes TCP changes now; its UDP ports stay
     /// as they are until it stops.
     pub ports: Vec<PortSpec>,
+}
+
+/// Request to set or clear a running machine's live CPU limit.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SetCpuLimitRequest {
+    /// Host CPU the machine's VMM may use, in milli-CPUs across all its vCPUs
+    /// (200 = a fifth of one CPU), from 1 to vCPUs × 1000. `null` clears the
+    /// limit back to one CPU per vCPU. Required: an empty body is refused.
+    /// The guest still sees all its vCPUs, and the limit holds for every later
+    /// launch of the machine until cleared.
+    #[schema(example = 200, required = true, nullable = true)]
+    #[serde(deserialize_with = "present_or_null")]
+    pub millicpus: Option<u32>,
+}
+
+/// Deserialize a field that must be present but may be `null`. Unlike a plain
+/// `Option`, a missing field is an error rather than `None`.
+fn present_or_null<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
 }
 
 /// Query string for `POST /machines/{name}/start`.
@@ -1738,6 +1773,17 @@ pub type BranchLeaseInfo = ForkLeaseInfo;
 
 #[cfg(test)]
 mod deny_unknown_field_tests {
+    #[test]
+    fn cpu_limit_requires_millicpus_and_null_clears() {
+        let set: SetCpuLimitRequest = serde_json::from_str(r#"{"millicpus":200}"#).unwrap();
+        assert_eq!(set.millicpus, Some(200));
+        let clear: SetCpuLimitRequest = serde_json::from_str(r#"{"millicpus":null}"#).unwrap();
+        assert_eq!(clear.millicpus, None);
+        assert!(serde_json::from_str::<SetCpuLimitRequest>("{}").is_err());
+        assert!(serde_json::from_str::<SetCpuLimitRequest>(r#"{"millicpus":-1}"#).is_err());
+        assert!(serde_json::from_str::<SetCpuLimitRequest>(r#"{"millicpus":1,"cpus":2}"#).is_err());
+    }
+
     /// An exec boots a stopped machine unless the caller opts out; the opt-out
     /// is what lets a readiness probe reach a machine without waking it.
     #[test]
