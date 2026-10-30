@@ -1271,10 +1271,13 @@ fn setup_persistent_rootfs() {
         ensure_mount_dir(STORAGE_TEMP_MOUNT);
         Some(std::thread::spawn(|| {
             // Resize before mount — template may be smaller than device.
-            // Skip if filesystem already fills the device (subsequent boots).
+            // Skip if filesystem already fills the device (subsequent boots),
+            // and leave a disk the host grew after it was mounted to the
+            // online growth below.
             // If resize fails (e.g. macOS-created template with incompatible features),
             // skip mount — mount_storage_disk() will handle mkfs fallback.
-            if !ext4_already_full_size(STORAGE_DEVICE)
+            let growth = ext4_growth_of_device(STORAGE_DEVICE);
+            if matches!(growth, Ext4Growth::Offline | Ext4Growth::Unknown)
                 && !resize_ext4_if_needed(STORAGE_DEVICE, "storage")
             {
                 boot_log(
@@ -1306,6 +1309,8 @@ fn setup_persistent_rootfs() {
                         err
                     ),
                 );
+            } else if growth == Ext4Growth::Online {
+                grow_mounted_ext4(smolvm_protocol::ManagedDisk::Storage, "storage");
             }
             mounted
         }))
@@ -1316,9 +1321,11 @@ fn setup_persistent_rootfs() {
     // Resize ext4 on the UNMOUNTED device before mounting. The host copies
     // from a small template (~512MB) then extends the sparse file. resize2fs
     // on a mounted device fails with "Resource busy" — must resize first.
-    // Skip if filesystem already fills the device (subsequent boots).
+    // Skip if filesystem already fills the device (subsequent boots), and
+    // grow a disk the host grew after it was mounted once it is mounted.
     // If resize fails (macOS-created template), the mount+mkfs fallback below handles it.
-    if !ext4_already_full_size(OVERLAY_DEVICE) {
+    let overlay_growth = ext4_growth_of_device(OVERLAY_DEVICE);
+    if matches!(overlay_growth, Ext4Growth::Offline | Ext4Growth::Unknown) {
         let _ = resize_ext4_if_needed(OVERLAY_DEVICE, "overlay");
     }
 
@@ -1338,34 +1345,34 @@ fn setup_persistent_rootfs() {
     };
 
     if !mounted {
-        // First boot — format the disk
-        let _ = std::process::Command::new("mkfs.ext4")
-            .args([
-                "-F",
-                "-q",
-                "-O",
-                "^has_journal",
-                "-L",
-                "smolvm-overlay",
-                OVERLAY_DEVICE,
-            ])
-            .status();
+        // First boot — format the disk, but only a blank one: an overlay that
+        // holds a filesystem holds the machine's root changes.
+        let formatted = format_blank_ext4(
+            "mkfs.ext4",
+            OVERLAY_DEVICE,
+            &["-O", "^has_journal", "-L", "smolvm-overlay"],
+            "overlay",
+        );
 
         let dev = cstr(OVERLAY_DEVICE);
         let mnt = cstr(OVERLAY_MOUNT);
         let ext4 = cstr("ext4");
         // SAFETY: retry mount after formatting with noatime
-        if unsafe {
-            libc::mount(
-                dev.as_ptr(),
-                mnt.as_ptr(),
-                ext4.as_ptr(),
-                libc::MS_NOATIME,
-                std::ptr::null(),
-            )
-        } != 0
+        if !formatted
+            || unsafe {
+                libc::mount(
+                    dev.as_ptr(),
+                    mnt.as_ptr(),
+                    ext4.as_ptr(),
+                    libc::MS_NOATIME,
+                    std::ptr::null(),
+                )
+            } != 0
         {
-            boot_log("ERROR", "failed to mount overlay disk after formatting");
+            boot_log(
+                "ERROR",
+                "overlay disk NOT mounted — root filesystem changes will not persist this boot",
+            );
             // Clean up the parallel storage mount so mount_storage_disk() fallback
             // does not hit EBUSY from an already-mounted /dev/vda.
             if let Some(handle) = storage_handle {
@@ -1379,6 +1386,11 @@ fn setup_persistent_rootfs() {
             }
             return;
         }
+    }
+
+    // A freshly formatted overlay already fills its device.
+    if mounted && overlay_growth == Ext4Growth::Online {
+        grow_mounted_ext4(smolvm_protocol::ManagedDisk::Overlay, "overlay");
     }
 
     // Create overlay directories
@@ -1712,59 +1724,119 @@ fn resize_ext4_if_needed(device: &str, label: &str) -> bool {
     }
 }
 
+/// How an ext4 filesystem comes to fill its block device at boot.
 #[cfg(target_os = "linux")]
-/// Check if ext4 filesystem already fills the block device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ext4Growth {
+    /// The filesystem already spans the device: nothing to do.
+    Full,
+    /// Grow it unmounted with resize2fs: a template that has never been
+    /// mounted, or a filesystem not marked clean, which the e2fsck fallback
+    /// checks in full before resize2fs retries.
+    Offline,
+    /// Grow it once mounted. The clean filesystem has been mounted since its
+    /// last check, which is every disk after its first boot, and resize2fs
+    /// refuses to grow it unmounted until `e2fsck -f` has run. The kernel
+    /// grows the mounted filesystem in place without that check.
+    Online,
+    /// No readable ext4 superblock: leave it to the resize, fsck and format
+    /// fallbacks.
+    Unknown,
+}
+
+/// Decide how an ext4 filesystem reaches the size of its device from its
+/// superblock (the 1024 bytes at byte offset 1024 of the device).
 ///
-/// Reads the ext4 superblock (at offset 1024) to get block_count and block_size,
-/// then compares against the device size. Returns true if the filesystem already
-/// spans the full device, meaning resize2fs would be a no-op. This avoids the
-/// ~5ms cost of spawning resize2fs on every subsequent boot.
+/// Mirrors resize2fs's own precondition for an unmounted filesystem: it must
+/// be marked valid, carry no error flag, and not have been mounted since its
+/// last check. Only the last condition sends a filesystem online: one that is
+/// not clean must be checked before it is grown at all.
+#[cfg(target_os = "linux")]
+fn ext4_growth(superblock: &[u8; 1024], device_bytes: u64) -> Ext4Growth {
+    let u16_at = |offset: usize| u16::from_le_bytes([superblock[offset], superblock[offset + 1]]);
+    let u32_at = |offset: usize| {
+        u32::from_le_bytes(
+            superblock[offset..offset + 4]
+                .try_into()
+                .expect("4-byte slice"),
+        )
+    };
+    // s_magic must be 0xEF53 before any other field is trusted.
+    if u16_at(56) != 0xEF53 || device_bytes == 0 {
+        return Ext4Growth::Unknown;
+    }
+    // s_log_block_size > 6 would mean blocks above 64 KiB: not valid ext4.
+    let log_block_size = u32_at(24);
+    if log_block_size > 6 {
+        return Ext4Growth::Unknown;
+    }
+    let block_size = 1024u64 << log_block_size;
+    // s_blocks_count_lo, plus s_blocks_count_hi when INCOMPAT_64BIT is set.
+    let mut blocks = u64::from(u32_at(4));
+    if u32_at(96) & 0x80 != 0 {
+        blocks |= u64::from(u32_at(0x150)) << 32;
+    }
+    let Some(fs_bytes) = blocks.checked_mul(block_size) else {
+        return Ext4Growth::Unknown;
+    };
+    // One block of slack: the filesystem may not use a partial last block.
+    if fs_bytes.saturating_add(block_size) >= device_bytes {
+        return Ext4Growth::Full;
+    }
+    // s_state: clean means EXT2_VALID_FS (1) set and EXT2_ERROR_FS (2) clear.
+    let state = u16_at(58);
+    let clean = state & 1 == 1 && state & 2 == 0;
+    // s_mtime and s_lastcheck, each widened by its high byte.
+    let mounted_at = u64::from(u32_at(44)) | u64::from(superblock[0x275]) << 32;
+    let checked_at = u64::from(u32_at(64)) | u64::from(superblock[0x277]) << 32;
+    if clean && mounted_at > checked_at {
+        Ext4Growth::Online
+    } else {
+        Ext4Growth::Offline
+    }
+}
+
+#[cfg(target_os = "linux")]
+/// Read a device's ext4 superblock and decide how it reaches the device size.
 ///
-/// Returns false (conservative, triggers resize path) on any error: unformatted
-/// device, non-ext4 filesystem, corrupt superblock, or I/O failure.
-fn ext4_already_full_size(device: &str) -> bool {
+/// Skips the ~5ms cost of spawning resize2fs on every boot where the
+/// filesystem already fills the device. Any read error is `Unknown`, which
+/// keeps the conservative resize path.
+fn ext4_growth_of_device(device: &str) -> Ext4Growth {
     use std::fs::File;
     use std::io::{Read, Seek, SeekFrom};
 
-    let mut f = match File::open(device) {
-        Ok(f) => f,
-        Err(_) => return false,
+    let Ok(mut f) = File::open(device) else {
+        return Ext4Growth::Unknown;
     };
-
     // For block devices, metadata().len() returns 0. Use seek to find size.
-    let dev_size = match f.seek(SeekFrom::End(0)) {
-        Ok(s) if s > 0 => s,
-        _ => return false,
+    let Ok(device_bytes) = f.seek(SeekFrom::End(0)) else {
+        return Ext4Growth::Unknown;
     };
-
-    // ext4 superblock starts at byte offset 1024. We need:
-    //   offset  4: s_blocks_count_lo (4 bytes)
-    //   offset 24: s_log_block_size  (4 bytes)
-    //   offset 56: s_magic           (2 bytes) — must be 0xEF53
-    let mut sb = [0u8; 64];
-    if f.seek(SeekFrom::Start(1024)).is_err() || f.read_exact(&mut sb).is_err() {
-        return false;
+    let mut superblock = [0u8; 1024];
+    if f.seek(SeekFrom::Start(1024)).is_err() || f.read_exact(&mut superblock).is_err() {
+        return Ext4Growth::Unknown;
     }
+    ext4_growth(&superblock, device_bytes)
+}
 
-    // Validate ext4 magic number before trusting any fields.
-    let magic = u16::from_le_bytes([sb[56], sb[57]]);
-    if magic != 0xEF53 {
-        return false;
+#[cfg(target_os = "linux")]
+/// Grow a mounted managed filesystem to fill its device after the host grew
+/// the disk of a stopped machine. A failure leaves the filesystem, and every
+/// file on it, at its previous size.
+fn grow_mounted_ext4(disk: smolvm_protocol::ManagedDisk, label: &str) {
+    match live_resources::grow_mounted_to_device(disk) {
+        Ok(bytes) => boot_log(
+            "INFO",
+            &format!("{label} filesystem grown online to {bytes} bytes"),
+        ),
+        Err(error) => boot_log(
+            "WARN",
+            &format!(
+                "{label} filesystem could not grow online, keeping its previous size: {error}"
+            ),
+        ),
     }
-
-    let log_block_size = u32::from_le_bytes([sb[24], sb[25], sb[26], sb[27]]);
-    // Sanity check: log_block_size > 6 means block_size > 64 MB, not valid ext4.
-    if log_block_size > 6 {
-        return false;
-    }
-    let block_size: u64 = 1024u64 << log_block_size;
-
-    let blocks_lo = u32::from_le_bytes([sb[4], sb[5], sb[6], sb[7]]) as u64;
-    let fs_size = blocks_lo * block_size;
-
-    // Allow 1 block of slack — filesystem may not use the very last block.
-    // Note: only uses s_blocks_count_lo (sufficient for disks up to 16 TB at 4K blocks).
-    fs_size + block_size >= dev_size
 }
 
 #[cfg(target_os = "linux")]
@@ -1841,11 +1913,10 @@ fn try_mount_storage_ext4() -> bool {
 /// Three-attempt fallback chain:
 /// 1. resize + mount (works on subsequent boots with Linux-native FS)
 /// 2. fsck + resize + mount (may fix minor corruption)
-/// 3. mkfs + mount (first boot from macOS template, or unrecoverable)
+/// 3. mkfs + mount, only for a disk that holds no ext4 filesystem (a blank
+///    first-boot disk); a disk with a filesystem is never formatted
 #[cfg(target_os = "linux")]
 fn mount_storage_disk() -> bool {
-    use std::process::Command;
-
     const STORAGE_DEVICE: &str = "/dev/vda";
     const STORAGE_MOUNT: &str = "/storage";
 
@@ -1873,9 +1944,20 @@ fn mount_storage_disk() -> bool {
     }
 
     // --- Attempt 1: resize (if needed) + mount (works on subsequent boots) ---
-    let resized =
-        ext4_already_full_size(STORAGE_DEVICE) || resize_ext4_if_needed(STORAGE_DEVICE, "storage");
+    // A clean filesystem the host grew after it was mounted is grown once
+    // mounted: resize2fs refuses it unmounted, and that refusal must never
+    // lead to the format below.
+    let growth = ext4_growth_of_device(STORAGE_DEVICE);
+    let resized = match growth {
+        Ext4Growth::Full | Ext4Growth::Online => true,
+        Ext4Growth::Offline | Ext4Growth::Unknown => {
+            resize_ext4_if_needed(STORAGE_DEVICE, "storage")
+        }
+    };
     if resized && try_mount_storage_ext4() {
+        if growth == Ext4Growth::Online {
+            grow_mounted_ext4(smolvm_protocol::ManagedDisk::Storage, "storage");
+        }
         info!("storage disk mounted after resize");
         create_storage_dirs(STORAGE_MOUNT);
         return true;
@@ -1888,10 +1970,35 @@ fn mount_storage_disk() -> bool {
         warn!("resize failed, attempting fsck repair before mount");
     }
 
-    let fsck_ok = match Command::new("fsck.ext4")
-        .args(["-y", "-f", STORAGE_DEVICE])
-        .status()
-    {
+    // --- Attempt 3: format, only a blank disk ---
+    if recover_storage_disk(
+        STORAGE_DEVICE,
+        "fsck.ext4",
+        "mkfs.ext4",
+        try_mount_storage_ext4,
+    ) {
+        create_storage_dirs(STORAGE_MOUNT);
+        return true;
+    }
+
+    error!("CRITICAL: could not mount storage disk after all recovery attempts");
+    false
+}
+
+#[cfg(target_os = "linux")]
+/// Repair and mount a storage disk the first mount refused, formatting it only
+/// when it holds no ext4 filesystem at all. A disk that holds one keeps it
+/// unmounted when it cannot be repaired: its layers, container changes and
+/// workspace are worth more than a booting machine.
+fn recover_storage_disk(
+    device: &str,
+    fsck: &str,
+    mkfs: &str,
+    mut try_mount: impl FnMut() -> bool,
+) -> bool {
+    use std::process::Command;
+
+    let fsck_ok = match Command::new(fsck).args(["-y", "-f", device]).status() {
         Ok(status) => {
             let code = status.code().unwrap_or(-1);
             if code <= 1 {
@@ -1903,46 +2010,96 @@ fn mount_storage_disk() -> bool {
             }
         }
         Err(e) => {
-            warn!(error = %e, "fsck.ext4 not available");
+            warn!(error = %e, "fsck.ext4 could not run");
             false
         }
     };
 
     if fsck_ok {
-        let _ = resize_ext4_if_needed(STORAGE_DEVICE, "storage");
-        if try_mount_storage_ext4() {
+        let _ = resize_ext4_if_needed(device, "storage");
+        if try_mount() {
             info!("storage disk mounted after fsck repair");
-            create_storage_dirs(STORAGE_MOUNT);
             return true;
         }
-        warn!("mount still failed after fsck, will format");
+        warn!("mount still failed after fsck");
     }
 
-    // --- Attempt 3: mkfs (last resort, destroys data) ---
-    info!("formatting storage disk (first boot or unrecoverable)");
-    match Command::new("mkfs.ext4")
-        .args(["-F", "-q", "-O", "^has_journal", STORAGE_DEVICE])
-        .status()
-    {
-        Ok(status) if status.success() => {}
-        Ok(status) => {
-            error!(exit_code = status.code().unwrap_or(-1), "mkfs.ext4 failed");
-            return false;
-        }
-        Err(e) => {
-            error!(error = %e, "mkfs.ext4 not available");
-            return false;
-        }
+    if !format_blank_ext4(mkfs, device, &["-O", "^has_journal"], "storage") {
+        return false;
     }
-
-    if try_mount_storage_ext4() {
+    if try_mount() {
         info!("storage disk mounted after format");
-        create_storage_dirs(STORAGE_MOUNT);
         return true;
     }
-
-    error!("CRITICAL: could not mount storage disk after all recovery attempts");
     false
+}
+
+#[cfg(target_os = "linux")]
+/// Whether a device holds an ext4 filesystem: the superblock magic 0xEF53 at
+/// byte 1080. A device too short to hold a superblock holds none.
+fn holds_ext4(device: &str) -> std::io::Result<bool> {
+    use std::os::unix::fs::FileExt;
+
+    let mut magic = [0u8; 2];
+    match std::fs::File::open(device)?.read_exact_at(&mut magic, 1024 + 56) {
+        Ok(()) => Ok(u16::from_le_bytes(magic) == 0xEF53),
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "linux")]
+/// Format a managed disk as ext4, but only a blank one (first boot). A disk
+/// that holds an ext4 filesystem holds the machine's data, so it is never
+/// formatted, whatever made it unmountable: it is left unmounted with an
+/// error instead. Returns whether the disk was formatted.
+fn format_blank_ext4(mkfs: &str, device: &str, options: &[&str], label: &str) -> bool {
+    match holds_ext4(device) {
+        Ok(false) => {}
+        Ok(true) => {
+            boot_log(
+                "ERROR",
+                &format!(
+                    "{label} disk holds an ext4 filesystem that could not be mounted or repaired; \
+                     refusing to format it, leaving it unmounted with its data intact"
+                ),
+            );
+            return false;
+        }
+        Err(error) => {
+            boot_log(
+                "ERROR",
+                &format!("{label} disk could not be read ({error}); refusing to format it"),
+            );
+            return false;
+        }
+    }
+    boot_log("INFO", &format!("formatting blank {label} disk"));
+    match std::process::Command::new(mkfs)
+        .args(["-F", "-q"])
+        .args(options)
+        .arg(device)
+        .status()
+    {
+        Ok(status) if status.success() => true,
+        Ok(status) => {
+            boot_log(
+                "ERROR",
+                &format!(
+                    "{label} disk: mkfs.ext4 failed (exit {})",
+                    status.code().unwrap_or(-1)
+                ),
+            );
+            false
+        }
+        Err(error) => {
+            boot_log(
+                "ERROR",
+                &format!("{label} disk: mkfs.ext4 could not run: {error}"),
+            );
+            false
+        }
+    }
 }
 
 /// Stub for non-Linux platforms.
@@ -8659,6 +8816,311 @@ mod bg_reap_tests {
         // Clean up so the test doesn't leak a 30-second sleep.
         let _ = child.kill();
         let _ = child.wait();
+    }
+}
+
+#[cfg(test)]
+#[cfg(target_os = "linux")]
+mod ext4_growth_tests {
+    use super::*;
+
+    const GIB: u64 = 1 << 30;
+
+    /// A clean 4 KiB-block superblock covering `fs_bytes`, last checked at
+    /// `checked_at` and last mounted at `mounted_at` (0 = never).
+    fn superblock(fs_bytes: u64, mounted_at: u32, checked_at: u32) -> [u8; 1024] {
+        let mut sb = [0u8; 1024];
+        sb[4..8].copy_from_slice(&((fs_bytes / 4096) as u32).to_le_bytes());
+        sb[24..28].copy_from_slice(&2u32.to_le_bytes());
+        sb[44..48].copy_from_slice(&mounted_at.to_le_bytes());
+        sb[56..58].copy_from_slice(&0xEF53u16.to_le_bytes());
+        sb[58..60].copy_from_slice(&1u16.to_le_bytes());
+        sb[64..68].copy_from_slice(&checked_at.to_le_bytes());
+        sb
+    }
+
+    #[test]
+    fn a_filesystem_filling_its_device_needs_nothing() {
+        assert_eq!(
+            ext4_growth(&superblock(20 * GIB, 200, 100), 20 * GIB),
+            Ext4Growth::Full
+        );
+        // A partial last block is not growth.
+        assert_eq!(
+            ext4_growth(&superblock(20 * GIB, 200, 100), 20 * GIB + 512),
+            Ext4Growth::Full
+        );
+    }
+
+    #[test]
+    fn a_never_mounted_template_grows_offline() {
+        assert_eq!(
+            ext4_growth(&superblock(GIB / 2, 0, 100), 20 * GIB),
+            Ext4Growth::Offline
+        );
+    }
+
+    #[test]
+    fn a_disk_grown_after_it_was_mounted_grows_online() {
+        // The stop -> grow storage -> start case: resize2fs refuses this
+        // filesystem unmounted, which used to leave /storage unmounted.
+        assert_eq!(
+            ext4_growth(&superblock(20 * GIB, 200, 100), 30 * GIB),
+            Ext4Growth::Online
+        );
+        // The high byte of s_mtime counts.
+        let mut sb = superblock(20 * GIB, 50, 100);
+        sb[0x275] = 1;
+        assert_eq!(ext4_growth(&sb, 30 * GIB), Ext4Growth::Online);
+    }
+
+    #[test]
+    fn a_filesystem_not_marked_clean_is_checked_before_it_grows() {
+        let mut unclean = superblock(20 * GIB, 200, 100);
+        unclean[58..60].copy_from_slice(&0u16.to_le_bytes());
+        assert_eq!(ext4_growth(&unclean, 30 * GIB), Ext4Growth::Offline);
+        let mut errors = superblock(20 * GIB, 200, 100);
+        errors[58..60].copy_from_slice(&3u16.to_le_bytes());
+        assert_eq!(ext4_growth(&errors, 30 * GIB), Ext4Growth::Offline);
+    }
+
+    #[test]
+    fn an_unreadable_superblock_keeps_the_conservative_path() {
+        let mut no_magic = superblock(20 * GIB, 200, 100);
+        no_magic[56] = 0;
+        assert_eq!(ext4_growth(&no_magic, 30 * GIB), Ext4Growth::Unknown);
+        let mut huge_blocks = superblock(20 * GIB, 200, 100);
+        huge_blocks[24..28].copy_from_slice(&7u32.to_le_bytes());
+        assert_eq!(ext4_growth(&huge_blocks, 30 * GIB), Ext4Growth::Unknown);
+        assert_eq!(ext4_growth(&superblock(GIB, 0, 1), 0), Ext4Growth::Unknown);
+    }
+
+    #[test]
+    fn the_64bit_block_count_high_word_counts() {
+        let mut sb = superblock(0, 200, 100);
+        sb[96..100].copy_from_slice(&0x80u32.to_le_bytes());
+        sb[0x150..0x154].copy_from_slice(&1u32.to_le_bytes());
+        // 2^32 blocks of 4 KiB = 16 TiB.
+        assert_eq!(ext4_growth(&sb, 16 << 40), Ext4Growth::Full);
+    }
+
+    /// Against real e2fsprogs: the classification matches what resize2fs
+    /// accepts. Skipped where e2fsprogs is not installed.
+    #[test]
+    fn classification_matches_resize2fs() {
+        use std::process::Command;
+        let tool = |name: &str| {
+            ["/sbin", "/usr/sbin", "/bin", "/usr/bin"]
+                .iter()
+                .map(|dir| std::path::Path::new(dir).join(name))
+                .find(|path| path.exists())
+        };
+        let (Some(mke2fs), Some(debugfs), Some(resize2fs)) =
+            (tool("mke2fs"), tool("debugfs"), tool("resize2fs"))
+        else {
+            eprintln!("skipping: e2fsprogs not installed");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let classify = |image: &std::path::Path| {
+            let bytes = std::fs::read(image).unwrap();
+            let sb: [u8; 1024] = bytes[1024..2048].try_into().unwrap();
+            ext4_growth(&sb, bytes.len() as u64)
+        };
+        let make = |name: &str| {
+            let image = dir.path().join(name);
+            let file = std::fs::File::create(&image).unwrap();
+            file.set_len(64 << 20).unwrap();
+            let made = Command::new(&mke2fs)
+                .args(["-F", "-q", "-t", "ext4", "-b", "4096"])
+                .arg(&image)
+                .arg("32M")
+                .output()
+                .unwrap();
+            assert!(made.status.success(), "{made:?}");
+            image
+        };
+
+        let template = make("template.ext4");
+        assert_eq!(classify(&template), Ext4Growth::Offline);
+        let grown = Command::new(&resize2fs).arg(&template).output().unwrap();
+        assert!(grown.status.success(), "{grown:?}");
+        assert_eq!(classify(&template), Ext4Growth::Full);
+
+        // Record a mount after the last check, as every boot does.
+        let used = make("used.ext4");
+        let stamped = Command::new(&debugfs)
+            .args(["-w", "-R", "ssv mtime 20300101"])
+            .arg(&used)
+            .output()
+            .unwrap();
+        assert!(stamped.status.success(), "{stamped:?}");
+        assert_eq!(classify(&used), Ext4Growth::Online);
+        let refused = Command::new(&resize2fs).arg(&used).output().unwrap();
+        assert!(!refused.status.success(), "{refused:?}");
+        assert!(
+            String::from_utf8_lossy(&refused.stdout).contains("e2fsck -f")
+                || String::from_utf8_lossy(&refused.stderr).contains("e2fsck -f"),
+            "{refused:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+#[cfg(target_os = "linux")]
+mod format_guard_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    fn tool(name: &str) -> Option<PathBuf> {
+        ["/sbin", "/usr/sbin", "/bin", "/usr/bin"]
+            .iter()
+            .map(|dir| Path::new(dir).join(name))
+            .find(|path| path.exists())
+    }
+
+    /// mkfs.ext4 and debugfs, or None (with a note) where e2fsprogs is absent.
+    fn e2fsprogs() -> Option<(PathBuf, PathBuf)> {
+        let found = tool("mkfs.ext4").zip(tool("debugfs"));
+        if found.is_none() {
+            eprintln!("skipping: e2fsprogs not installed");
+        }
+        found
+    }
+
+    fn blank(dir: &Path, name: &str) -> String {
+        let path = dir.join(name);
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(64 << 20)
+            .unwrap();
+        path.to_str().unwrap().to_owned()
+    }
+
+    /// An ext4 image holding one file, like a disk after the machine ran.
+    fn with_data(dir: &Path, name: &str, mkfs: &Path, debugfs: &Path) -> String {
+        let image = blank(dir, name);
+        let made = Command::new(mkfs)
+            .args(["-F", "-q", &image])
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{made:?}");
+        let source = dir.join("payload");
+        std::fs::write(&source, b"machine data").unwrap();
+        let written = Command::new(debugfs)
+            .args([
+                "-w",
+                "-R",
+                &format!("write {} keep", source.display()),
+                &image,
+            ])
+            .output()
+            .unwrap();
+        assert!(written.status.success(), "{written:?}");
+        image
+    }
+
+    fn read_keep(debugfs: &Path, image: &str) -> String {
+        let out = Command::new(debugfs)
+            .args(["-R", "cat /keep", image])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    fn failing_fsck(dir: &Path, code: i32) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(format!("fsck-exit-{code}"));
+        std::fs::write(&path, format!("#!/bin/sh\nexit {code}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_str().unwrap().to_owned()
+    }
+
+    #[test]
+    fn a_blank_storage_disk_is_formatted() {
+        let Some((mkfs, _)) = e2fsprogs() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let disk = blank(dir.path(), "storage.raw");
+        assert!(!holds_ext4(&disk).unwrap());
+        let mut mounts = 0;
+        // fsck cannot even start on a blank disk; the format must still run.
+        let mounted = recover_storage_disk(
+            &disk,
+            "/nonexistent/fsck.ext4",
+            mkfs.to_str().unwrap(),
+            || {
+                mounts += 1;
+                true
+            },
+        );
+        assert!(mounted, "the formatted blank disk is mounted");
+        assert_eq!(mounts, 1, "mounted once, after the format");
+        assert!(holds_ext4(&disk).unwrap());
+    }
+
+    #[test]
+    fn a_storage_disk_with_data_is_never_formatted() {
+        let Some((mkfs, debugfs)) = e2fsprogs() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mkfs_path = mkfs.to_str().unwrap();
+        // fsck cannot start (the libblkid failure), fsck cannot repair, and
+        // fsck succeeds but the mount is still refused.
+        for fsck in [
+            "/nonexistent/fsck.ext4".to_owned(),
+            failing_fsck(dir.path(), 4),
+            failing_fsck(dir.path(), 8),
+            failing_fsck(dir.path(), 0),
+        ] {
+            let disk = with_data(dir.path(), "storage.raw", &mkfs, &debugfs);
+            let before = std::fs::read(&disk).unwrap();
+            assert!(
+                !recover_storage_disk(&disk, &fsck, mkfs_path, || false),
+                "{fsck}"
+            );
+            assert!(
+                std::fs::read(&disk).unwrap() == before,
+                "{fsck} changed the disk"
+            );
+            assert_eq!(read_keep(&debugfs, &disk), "machine data", "{fsck}");
+        }
+    }
+
+    #[test]
+    fn an_overlay_disk_is_formatted_only_when_blank() {
+        let Some((mkfs, debugfs)) = e2fsprogs() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mkfs_path = mkfs.to_str().unwrap();
+        let options = ["-O", "^has_journal", "-L", "smolvm-overlay"];
+
+        let fresh = blank(dir.path(), "fresh.raw");
+        assert!(format_blank_ext4(mkfs_path, &fresh, &options, "overlay"));
+        assert!(holds_ext4(&fresh).unwrap());
+
+        let used = with_data(dir.path(), "overlay.raw", &mkfs, &debugfs);
+        let before = std::fs::read(&used).unwrap();
+        assert!(!format_blank_ext4(mkfs_path, &used, &options, "overlay"));
+        assert!(std::fs::read(&used).unwrap() == before);
+        assert_eq!(read_keep(&debugfs, &used), "machine data");
+    }
+
+    #[test]
+    fn an_unreadable_disk_is_not_formatted_and_a_tiny_one_holds_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.raw");
+        assert!(!format_blank_ext4(
+            "/bin/true",
+            missing.to_str().unwrap(),
+            &[],
+            "storage"
+        ));
+        let tiny = dir.path().join("tiny.raw");
+        std::fs::write(&tiny, [0u8; 100]).unwrap();
+        assert!(!holds_ext4(tiny.to_str().unwrap()).unwrap());
     }
 }
 
